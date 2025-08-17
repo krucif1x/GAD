@@ -1,0 +1,436 @@
+#include <WiFi.h> //For COnnecting ESP3 to Wifi Network
+#include <Wire.h> //For I2C Communication to estbalish connection to sensors
+#include <math.h>
+#include "MAX30105.h" //For controlling oximeter model MAX30105 but can also be sued fro other variants
+#include "heartRate.h" //Algorithms to calculate Heart Rate (BPM)
+#include <HTTPClient.h> //To Send HTTP requests to a server (POST data)
+//#include <BLEDevice.h>
+//#include <BLEUtils.h>
+//#include <BLEServer.h>
+
+#define SDA 9
+#define SCL 8
+
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+
+//WIFI SSID, Password and Server URL to send Health Parametric Data
+//It is so that ESP32 knows how to connect and where to upload data
+const char* ssid = "CARBON-NETRAL";
+const char* password = "Toyota123!";
+String serverURL = "http://203.100.57.59:3000/api/v1/health";
+
+// Objects/Instances
+MAX30105 particleSensor;
+WiFiClient client;
+// small ring buffer to smooth heart rate readings
+#define RATE_SIZE 5
+byte rates[RATE_SIZE] = {0};
+byte rateSpot = 0;
+// track if red LED is currently set on (logical state)
+bool redOn = false;
+//BLEServer *pServer = nullptr;
+//BLECharacteristic *pCharacteristic = nullptr;
+
+// Measurement Variables (Maybe Needs to be calibrated again)
+float bodyTemperature = 0;
+const float slope = 0.00002;
+const float intercept = 34.5;
+
+
+//Heart rate Calculation and Smoothing Variables
+//Purpose: Hold Recenet Heart Rate to smooth it out (average over last 5 readings).
+//Why: Heart rate sensors are noisy; averaging improves accuracy.
+
+
+long lastBeat = 0;
+float beatsPerMinute = 0;
+float beatAvg = 0;
+int estimatedSBP = 0; //Systolic Blood Pressure (Estimate)
+int estimatedDBP = 0; //Diastolic Blood Pressure (Estimate)
+
+int spo2 = 0;
+float respiratoryRate = 0;
+
+//State Management
+bool collectingData = false;
+bool dataDisplayed = false;
+int stableCount = 0;
+
+
+
+// WiFi State Handling
+// collectingData, dataDisplayed, stableCount: Track if data is being collected and if conditions are stable.
+// irValues, redValues, mafIndex: For a Moving Average Filter (MAF) to smooth noisy sensor data.
+unsigned long lastWifiAttempt = 0;
+const unsigned long wifiRetryInterval = 5000;
+volatile bool wifiConnected = false;
+
+bool scanMessageDisplayed = false; 
+
+
+//Oximeter Built-In LED Control
+//Purpose: Control the MAX30105’s red LED brightness depending on finger placemen
+const byte RED_LED_BRIGHT = 0xFF; // Intensitas terang, disesuaikan dengan kebutuhan Anda (0x00 - 0xFF)
+const byte RED_LED_LOW = 0x00;   // Intensitas rendah
+
+
+// === BLE CALLBACK ===
+/*class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) 
+      String value = (pCharacteristic->getValue().c_str());
+      Serial.println(value);
+  }
+};
+*/
+
+// === SETUP UTAMA ===
+/*
+Purpose:
+Start serial port (for debugging).
+Start I2C with the sensor.
+Connect to WiFi.
+Initialize sensor.
+Start two tasks (sensorTask and wifiTask) on different CPU cores of ESP32 using FreeRTOS.
+*/
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA, SCL);
+
+  //setupBLE();
+  setupWiFi();
+  setupSensor();
+
+  // Jalankan task RTOS
+  xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(wifiTask, "WiFiTask", 2048, NULL, 1, NULL, 0);
+}
+
+void loop() {
+  // Kosong, semua dikerjakan oleh task
+}
+
+void setupSensor() {
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 tidak ditemukan.");
+    while (1);  // Stop if sensor not found
+  }
+  particleSensor.setup();
+  
+  // Mengatur kecerahan LED merah pada awalnya (lebih redup saat sensor pertama kali dijalankan)
+  particleSensor.setPulseAmplitudeRed(RED_LED_LOW);  // Mengatur LED merah dengan kecerahan rendah pada awalnya
+  particleSensor.setPulseAmplitudeGreen(0); 
+}
+
+// === TASK WiFi ===
+/*
+Purpose:
+1. Runs on its own core/thread.
+2. Keeps checking WiFi status.
+3. If disconnected, tries to reconnect every 5 seconds.
+4. Updates the wifiConnected flag.
+*/
+void wifiTask(void *pvParameters) {
+  while (true) {
+    if (WiFi.status() != WL_CONNECTED) {
+      if (millis() - lastWifiAttempt >= wifiRetryInterval) {
+        Serial.println("[WiFi] Reconnecting...");
+        WiFi.begin(ssid, password);
+        lastWifiAttempt = millis();
+      }
+      wifiConnected = false;
+    } else {
+      if (!wifiConnected) {
+        Serial.println("[WiFi] Connected!");
+        wifiConnected = true;
+      }
+    }
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+
+//Exponential Moving Average (EMA) filter and per-channel states (individual states for IR and Red Light)
+struct EMA {
+  float y = 0.0f;      // stored (DC) value
+  float alpha = 0.02f; // 0<alpha<=1; smaller = smoother
+  bool init = false;
+};
+
+float emaUpdate(EMA &f, float x) {
+  if (!f.init) { f.y = x; f.init = true; }
+  else         { f.y += f.alpha * (x - f.y); }
+  return f.y;
+}
+
+// Per-channel DC trackers
+EMA dcIR{0, 0.02f, false};
+EMA dcRed{0, 0.02f, false};
+
+
+
+// === TASK Sensor ===
+/*
+1. Reads sensor every 10 ms.
+2. Applies moving average filter to IR/Red readings.
+3. Estimates body temp.
+4. Checks for “finger placed” (IR signal > threshold).
+5. If no finger, reset states, turn off LED, wait.
+6. If finger detected, turn on LED, start collecting data.
+7. Calculate SpO2, body temp, respiratory rate (once per session).
+8. Collect heart rate.
+9. When data is “stable” (BPM in normal range), display and send to server (once per reading).
+*/
+void sensorTask(void *pvParameters) {
+  constexpr int SAMPLE_INTERVAL = 10;  // Interval pengambilan sampel dalam milidetik
+  unsigned long lastSampleTime = 0;
+  //bool isBodyTempCalculated = false;  // Flag untuk memastikan Body Temperature hanya dihitung sekali
+  //bool isRespiratoryRateCalculated = false; 
+  while (true) {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastSampleTime >= SAMPLE_INTERVAL) {
+      lastSampleTime = currentMillis;
+
+      long ir = particleSensor.getIR();
+      long red = particleSensor.getRed();
+
+      // DC (baseline) per channel
+      float irDC  = emaUpdate(dcIR,  (float)ir);
+      float redDC = emaUpdate(dcRed, (float)red);
+
+      // AC (pulse) per channel
+      float irAC  = (float)ir  - irDC;
+      float redAC = (float)red - redDC;
+
+
+      //bodyTemperature = (mafIR * slope) + intercept;
+
+      if (irDC < 50000 || red == 0) {
+        resetMeasurements();
+        //isBodyTempCalculated = false;
+        //isRespiratoryRateCalculated = false;
+  particleSensor.setPulseAmplitudeRed(RED_LED_LOW);
+        Serial.println("Letakkan jari di sensor");
+        scanMessageDisplayed = false;
+  redOn = false;
+        vTaskDelay(500 / portTICK_PERIOD_MS);  // Cegah overloading dengan delay ringan
+        continue;  // Langsung melanjutkan ke iterasi berikutnya 
+      }
+      particleSensor.setPulseAmplitudeRed(RED_LED_BRIGHT);
+      if (!scanMessageDisplayed) {
+        Serial.println("Scanning Your Health Condition");
+        scanMessageDisplayed = true;
+      }
+
+      // Hanya menghitung SpO2 jika belum dihitung sebelumny
+      calculateSpO2(irAC, redAC, irDC, redDC);
+
+      /*  
+      // Hanya menghitung Body Temperature jika belum dihitung sebelumnya
+      if (!isBodyTempCalculated) {
+        isBodyTempCalculated = true;  // Set flag setelah dihitung
+      }
+
+      // Hanya menghitung Respiratory Rate jika belum dihitung sebelumnya
+      if (!isRespiratoryRateCalculated) {
+        calculateRespiratoryRate(mafIR);
+        isRespiratoryRateCalculated = true;  // Set flag setelah dihitung
+      }
+      */
+
+      // Menghitung data sensor hanya sekali ketika data stabil
+      if (!collectingData) {
+        collectingData = true;
+        stableCount = 0;
+        dataDisplayed = false;
+        memset(rates, 0, sizeof(rates));
+        rateSpot = 0;
+      }
+
+      // Menghitung data kesehatan
+      calculateHeartRate(ir);
+   
+
+      // Validasi rentang BPM, SpO2, dan tekanan darah untuk memastikan data valid
+      if (beatAvg >= 60 && beatAvg <= 120) {
+        stableCount++;
+        if (stableCount >= 3 && !dataDisplayed) {  // require 3 consecutive valid beats
+          displayData();
+          if (wifiConnected) sendDataToServer();
+          dataDisplayed = true;
+        }
+      } else {
+        stableCount = 0;
+        dataDisplayed = false;
+      }
+    }
+
+    vTaskDelay(1);  // Memberi waktu untuk task lain agar dapat berjalan dengan baik
+  }
+}
+
+// === SETUP BLE ===
+/*
+void setupBLE() {
+  BLEDevice::init("ESP32S3_BLE_Server");
+  pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE 
+  );
+
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  pCharacteristic->setValue("Hello Client!");
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->start();
+  Serial.println(BLEDevice::getAddress().toString().c_str());
+}
+
+*/
+// === SETUP WiFi ===
+void setupWiFi() {
+  Serial.println("[WiFi] Connecting...");
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
+}
+
+// === UTILITIES ===
+// Reset all measurement variables when no finger is detected.
+void resetMeasurements() {
+  collectingData = false;
+  dataDisplayed = false;
+  stableCount = 0;
+  beatAvg = estimatedSBP = estimatedDBP = spo2 = 0;
+  respiratoryRate = bodyTemperature = 0;
+}
+
+
+/*
+1. Detects heartbeats using IR signal (from checkForBeat algorithm).
+2. Calculates BPM as 60/delta (delta = time between beats).
+3. Updates rolling average of BPM, and estimates systolic/diastolic BP with simple formula.
+*/
+void calculateHeartRate(long ir) {
+  if (checkForBeat(ir)) {
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
+    beatsPerMinute = 60 / (delta / 1000.0);
+    //if (beatsPerMinute < 30 || beatsPerMinute > 180) return;
+
+    //rates[rateSpot++] = (byte)beatsPerMinute;
+    //rateSpot %= RATE_SIZE;
+        // Menghitung weighted average (rata-rata berbobot) dengan nilai terbaru lebih diprioritaskan
+    //float weight = 0.9;  // Memberikan bobot lebih besar pada pembacaan terbaru
+    //float weightedSum = 0;
+    //float sum = 0;
+    //for (byte i = 0; i < RATE_SIZE; i++) {
+      //sum += rates[i];  // Menjumlahkan semua nilai BPM dalam array
+    //}
+    //float averageBPM = sum / RATE_SIZE; 
+    // Menghitung weighted average dari array rates[]
+    //for (byte i = 0; i < RATE_SIZE; i++) {
+      //float currentWeight = (i == rateSpot) ? weight : (1 - weight) / (RATE_SIZE - 1);
+      //weightedSum += currentWeight * rates[i];  // Bobot lebih tinggi untuk nilai terbaru
+    //}
+
+    // Update beatAvg dengan nilai rata-rata berbobot
+    //beatAvg = weightedSum;
+    //float weight = 0.2;
+  beatAvg = 0.3f * beatsPerMinute + 0.7f * beatAvg;
+
+    //beatAvg = 0;
+    //for (byte x = 0; x < RATE_SIZE; x++)
+      //  beatAvg += rates[x];
+    //beatAvg /= RATE_SIZE;
+    //beatAvg = averageBPM + 10;
+    estimatedSBP = 60 + 0.5 * beatsPerMinute + 0.2 * beatAvg;
+    estimatedDBP = 60 + 0.3 * beatsPerMinute - 0.1 * beatAvg;
+    Serial.println("AVG :"); Serial.println(beatAvg);
+    Serial.println("SBP :"); Serial.println(estimatedSBP);
+    Serial.println("DBP :"); Serial.println(estimatedDBP);
+    Serial.println("Heartrate Done");
+  }
+}
+
+
+
+/*
+1. Calculates SpO2 using ratio of AC and DC components of red/IR signals.
+2. Uses a typical empirical formula.
+3. Constrains result to 0-99%.
+*/
+void calculateSpO2(float irAC, float redAC, float irDC, float redDC) {
+  if (irDC <= 0 || redDC <= 0) { spo2 = 0; return; }
+  float ratioIR  = irAC / irDC;
+  float ratioRed = redAC / redDC;
+
+  // Protect against division by very small numbers
+  if (fabs(ratioIR) < 1e-6) { spo2 = 0; return; }
+
+  float R = ratioRed / ratioIR;
+
+  // Empirical linear approximation
+  int sp = (int)roundf(130.0f - 25.0f * R);
+  spo2 = constrain(sp, 0, 99);
+}
+
+/*
+//Estimates breaths per minute by timing large changes in IR (not super accurate, but basic idea).
+void calculateRespiratoryRate(float ir) {
+  static long lastRRTime = millis();
+  long now = millis();
+  float delta = now - lastRRTime;
+  if (delta > 1000 && delta < 5000) {
+    respiratoryRate = 60.0 / (delta / 1000.0);
+    lastRRTime = now;
+  }
+  respiratoryRate = constrain(respiratoryRate, 12, 20);
+  Serial.println("RR Done");
+}
+*/
+
+
+/*
+1. Constructs a JSON string with all health data.
+2. Sends it to the server via HTTP POST.
+3. Prints server response to Serial.
+*/
+void sendDataToServer() {
+  HTTPClient http;
+  http.setTimeout(5000);
+  http.begin(client, serverURL);
+  http.addHeader("Content-Type", "application/json");
+
+  String httpRequestData = "{\"user_id\":\"9\",\"respiratoryRate\":\"" + String(respiratoryRate) +
+                "\",\"diastole_pressure\":\"" + String(estimatedDBP) +
+                "\",\"systole_pressure\":\"" + String(estimatedSBP) +
+                "\",\"heartRate\":\"" + String(beatAvg) +
+                "\",\"spo2\":\"" + String(spo2) +
+                "\",\"body_temp\":\"" + String(bodyTemperature) + "\"}";
+
+  int httpResponseCode = http.POST(httpRequestData);
+  Serial.println("[HTTP] Status: " + String(httpResponseCode));
+  if (httpResponseCode > 0) Serial.println("[HTTP] Response: " + http.getString());
+  http.end();
+}
+
+//Purpose: Nicely prints all the measured data to the Serial Monitor.
+void displayData() {
+  Serial.println("===== HEALTH DATA =====");
+  Serial.print("BPM: "); Serial.println(beatAvg);
+  Serial.print("SpO2: "); Serial.println(spo2);
+  //Serial.print("Body Temp: "); Serial.println(bodyTemperature, 1);
+  Serial.print("SBP: "); Serial.println(estimatedSBP);
+  Serial.print("DBP: "); Serial.println(estimatedDBP);
+  //Serial.print("Respiratory Rate: "); Serial.println(respiratoryRate, 0);
+  Serial.println("========================");
+}
